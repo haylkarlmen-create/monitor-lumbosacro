@@ -5,699 +5,1925 @@ Created on Thu Nov  5 22:24:43 2026
 @author: Usuario
 """
 
-from flask import Flask, render_template_string
+from flask import Flask, request, jsonify, render_template_string
+import os
+import time
+import threading
+import math
+import hmac
 
 app = Flask(__name__)
+
+# ==========================================
+# CONFIGURACION DEL SERVIDOR
+# ==========================================
+
+TOKEN = os.environ.get("MONITOR_TOKEN", "")
+
+lock = threading.Lock()
+
+latest = {
+    "sensores": [],
+    "ultima": 0,
+    "secuencia": 0
+}
+
+# ==========================================
+# RECIBIR DATOS REALES DE LA ESP32
+# ==========================================
+
+@app.route("/api/datos", methods=["POST"])
+def recibir():
+
+    if not TOKEN or not hmac.compare_digest(
+        request.headers.get("X-Token", ""), TOKEN
+    ):
+        return jsonify(error="No autorizado"), 401
+
+    body = request.get_json(silent=True)
+
+    rows = body.get("sensores") if isinstance(
+        body, dict
+    ) else None
+
+    if not isinstance(rows, list) or len(rows) != 4:
+        return jsonify(
+            error="Se requieren cuatro sensores"
+        ), 400
+
+    try:
+        clean = []
+
+        for i, s in enumerate(rows):
+
+            if not isinstance(s, dict):
+                raise ValueError()
+
+            if s["sensor"] != i + 1:
+                raise ValueError()
+
+            nivel = float(s["nivel"])
+            resistencia = s["resistencia"]
+            adc = int(s["adc"])
+
+            permanencia = int(s["permanencia"])
+            tiempo_alto = int(s["tiempo_alto"])
+
+            if not math.isfinite(nivel):
+                raise ValueError()
+
+            if not 0 <= nivel <= 100:
+                raise ValueError()
+
+            if not 0 <= adc <= 4095:
+                raise ValueError()
+
+            if min(permanencia, tiempo_alto) < 0:
+                raise ValueError()
+
+            if resistencia is not None:
+
+                resistencia = float(resistencia)
+
+                if not math.isfinite(resistencia):
+                    raise ValueError()
+
+                if resistencia < 0:
+                    raise ValueError()
+
+            estado = s["estado"]
+            alarma = s["alarma"]
+
+            if estado not in (
+                "NORMAL", "PREVENTIVO", "RIESGO"
+            ):
+                raise ValueError()
+
+            if type(alarma) is not bool:
+                raise ValueError()
+
+            clean.append({
+                "sensor": i + 1,
+                "nivel": nivel,
+                "resistencia": resistencia,
+                "adc": adc,
+                "permanencia": permanencia,
+                "tiempo_alto": tiempo_alto,
+                "estado": estado,
+                "alarma": alarma
+            })
+
+    except (
+        KeyError, TypeError,
+        ValueError, OverflowError
+    ):
+        return jsonify(
+            error="Lecturas invalidas"
+        ), 400
+
+    with lock:
+
+        latest.update(
+            sensores=clean,
+            ultima=time.time(),
+            secuencia=latest["secuencia"] + 1
+        )
+
+    return jsonify(
+        estado="Datos recibidos correctamente"
+    )
+
+
+# ==========================================
+# ENVIAR DATOS A LA INTERFAZ
+# ==========================================
+
+@app.route("/api/datos", methods=["GET"])
+def datos():
+
+    with lock:
+        result = dict(latest)
+
+    result["conectado"] = (
+        time.time() - result["ultima"]
+    ) < 15
+
+    response = jsonify(result)
+
+    response.headers["Cache-Control"] = "no-store"
+
+    return response
+
+
+# ==========================================
+# INTERFAZ GRAFICA
+# ==========================================
 
 HTML = """
 <!DOCTYPE html>
 <html lang="es">
+
 <head>
+
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<meta name="viewport"
+content="width=device-width, initial-scale=1.0">
+
 <title>Monitor Lumbosacro</title>
 
 <style>
+
+/* =====================================
+   ESTILO GENERAL
+===================================== */
+
 * {
     box-sizing: border-box;
 }
 
 body {
     margin: 0;
+    background: #eef7fb;
+    color: #164e63;
     font-family: Arial, sans-serif;
-    background: #081522;
-    color: #eaf6ff;
 }
 
 header {
-    padding: 26px;
-    text-align: center;
-    background: linear-gradient(120deg, #10283e, #164965);
-    border-bottom: 3px solid #00c8ff;
+    background: linear-gradient(
+        120deg, #e0f2fe, #ccfbf1
+    );
+    padding: 32px 20px;
+    border-bottom: 1px solid #b6e4ed;
+}
+
+header > div {
+    max-width: 1180px;
+    margin: auto;
 }
 
 h1 {
-    color: #67e8f9;
     margin: 0;
-    font-size: 29px;
+    font-size: 36px;
+    color: #155e75;
 }
 
 h2 {
-    color: #9ddfff;
     font-size: 21px;
+    margin: 0 0 16px;
+    color: #155e75;
 }
 
-.subtitulo {
-    color: #c3d9e8;
-    margin-top: 10px;
+h3 {
+    font-size: 16px;
+    margin: 8px 0;
 }
 
-.contenedor {
-    max-width: 1250px;
+p {
+    line-height: 1.5;
+}
+
+main {
+    max-width: 1180px;
     margin: auto;
-    padding: 22px;
+    padding: 24px 16px;
+}
+
+.muted {
+    color: #526c7d;
+    font-size: 14px;
+}
+
+/* =====================================
+   PANELES Y TARJETAS
+===================================== */
+
+.panel,
+.sensor {
+
+    background: white;
+    border: 1px solid #d5e8ef;
+    border-radius: 18px;
+    padding: 20px;
+
+    box-shadow:
+    0 4px 16px rgba(22,78,99,0.06);
 }
 
 .panel {
-    background: #142b40;
-    border: 1px solid #30516a;
-    border-radius: 16px;
-    padding: 22px;
-    margin-bottom: 22px;
+    margin-bottom: 18px;
 }
 
-.tarjetas {
+.cards {
+
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 16px;
+
+    grid-template-columns:
+    repeat(4, minmax(0, 1fr));
+
+    gap: 14px;
+    margin-bottom: 18px;
 }
 
-.tarjeta {
-    background: #1b3b55;
-    padding: 22px;
-    border-radius: 14px;
-    text-align: center;
-}
+.number {
 
-.numero {
-    font-size: 46px;
+    font-size: 38px;
     font-weight: bold;
-    margin: 15px 0;
+    margin: 14px 0;
+
+    color: #0891b2;
 }
 
-.barra {
-    height: 15px;
-    background: #071522;
-    border-radius: 12px;
+.bar {
+
+    height: 9px;
+    background: #e0f2fe;
+    border-radius: 10px;
     overflow: hidden;
 }
 
-.progreso {
+.fill {
+
     height: 100%;
     width: 0%;
+
+    background: #14b8a6;
+
     transition: width 0.3s;
 }
 
-.estado {
-    margin-top: 12px;
+.state {
+
+    font-size: 13px;
     font-weight: bold;
+    margin-top: 14px;
 }
 
-.fila {
+.two {
+
     display: grid;
+
     grid-template-columns: 1fr 1fr;
-    gap: 20px;
+
+    gap: 18px;
 }
 
-.control {
-    background: #1b3b55;
-    padding: 17px;
-    border-radius: 12px;
-    margin-bottom: 15px;
-}
+/* =====================================
+   BOTONES
+===================================== */
 
-.control label {
-    display: block;
-    margin-bottom: 12px;
-    font-weight: bold;
-}
+.controls {
 
-input[type=range] {
-    width: 100%;
-    cursor: pointer;
-    accent-color: #00c8ff;
-}
-
-.mapa {
     display: flex;
-    justify-content: center;
-    align-items: center;
-    gap: 15px;
-    padding: 35px 10px;
-    background: #091b2b;
-    border-radius: 14px;
-}
-
-.zona {
-    width: 95px;
-    height: 125px;
-    border-radius: 40px;
-    background: #22c55e;
-    color: #061522;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-weight: bold;
-    text-align: center;
-    transition: background 0.3s;
-}
-
-.central {
-    height: 150px;
-}
-
-canvas {
-    width: 100%;
-    height: 260px;
-    background: #091b2b;
-    border-radius: 12px;
-}
-
-.alerta {
-    background: #123d35;
-    border: 2px solid #22c55e;
-    border-radius: 12px;
-    padding: 20px;
-    text-align: center;
-    font-size: 20px;
-    font-weight: bold;
-}
-
-.alerta.activa {
-    background: #711c30;
-    border-color: #fb7185;
-    animation: parpadeo 1s infinite;
-}
-
-@keyframes parpadeo {
-    50% { opacity: 0.65; }
+    gap: 8px;
+    flex-wrap: wrap;
 }
 
 button {
-    background: #00b8e6;
-    color: #061522;
-    padding: 12px 18px;
-    border: none;
-    border-radius: 9px;
+
+    border: 1px solid #a5d8e4;
+
+    background: #e6f9fb;
+    color: #155e75;
+
+    border-radius: 10px;
+
+    padding: 12px 15px;
+
+    font-size: 14px;
     font-weight: bold;
+
     cursor: pointer;
-    margin: 5px;
+
+    transition: background 0.2s;
 }
 
 button:hover {
-    background: #67e8f9;
+    background: #c5f2f4;
 }
 
-.registro {
-    background: #091b2b;
-    padding: 15px;
-    border-radius: 10px;
-    height: 160px;
-    overflow-y: auto;
+button:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.status {
+
+    display: inline-block;
+
+    background: white;
+
+    border-radius: 30px;
+
+    padding: 9px 16px;
+
+    font-weight: bold;
+
+    margin-top: 12px;
+
+    color: #0d9488;
+}
+
+/* =====================================
+   ALARMAS
+===================================== */
+
+.alert {
+
+    padding: 18px;
+
+    border-radius: 12px;
+
+    background: #edf6fa;
+
+    border: 1px solid #c9e1eb;
+
+    font-weight: bold;
+}
+
+.alert.high {
+
+    background: #fff1f2;
+
+    color: #be123c;
+
+    border-color: #fda4af;
+
+    animation: parpadeo 1s infinite;
+}
+
+.alert.ok {
+
+    background: #ecfdf5;
+
+    color: #047857;
+
+    border-color: #99f6e4;
+}
+
+@keyframes parpadeo {
+
+    50% {
+        opacity: 0.65;
+    }
+}
+
+/* =====================================
+   GRAFICAS Y MAPA
+===================================== */
+
+canvas {
+
+    width: 100%;
+    height: 280px;
+
+    display: block;
+}
+
+svg {
+
+    width: 100%;
+
+    max-height: 270px;
+
+    display: block;
+}
+
+.legend {
+
+    display: flex;
+
+    flex-wrap: wrap;
+
+    gap: 15px;
+
+    font-size: 13px;
+
+    margin-top: 12px;
+}
+
+/* =====================================
+   REGISTRO DE EVENTOS
+===================================== */
+
+.log {
+
+    max-height: 190px;
+
+    overflow: auto;
+
     font-size: 14px;
-    color: #c1d9e8;
+
+    background: #f4fafc;
+
+    border-radius: 10px;
+
+    padding: 10px;
 }
 
-.verde { color: #4ade80; }
-.amarillo { color: #facc15; }
-.rojo { color: #fb7185; }
+.log div {
+
+    padding: 9px;
+
+    border-bottom: 1px solid #e5eef3;
+}
 
 footer {
+
     text-align: center;
-    color: #91a9bb;
+
     padding: 20px;
+
+    color: #526c7d;
+
+    font-size: 13px;
 }
 
-@media(max-width: 750px) {
-    .tarjetas, .fila {
+/* =====================================
+   ADAPTACION PARA CELULARES
+===================================== */
+
+@media(max-width: 850px) {
+
+    .cards {
+
+        grid-template-columns:
+        repeat(2, minmax(0, 1fr));
+    }
+
+    .two {
+
         grid-template-columns: 1fr;
     }
 
-    h1 { font-size: 23px; }
+    h1 {
+        font-size: 28px;
+    }
 }
+
+@media(max-width: 400px) {
+
+    .sensor {
+        padding: 12px;
+    }
+
+    .number {
+        font-size: 30px;
+    }
+}
+
 </style>
+
 </head>
 
 <body>
 
+<!-- ==================================
+     ENCABEZADO
+=================================== -->
+
 <header>
-    <h1>SISTEMA DE MONITOREO LUMBOSACRO</h1>
-    <p class="subtitulo">
-        Proyecto Integrador - Ingenieria Biomedica
+
+<div>
+
+    <h1>Monitor Lumbosacro</h1>
+
+    <p>
+        Sistema de monitoreo biomecánico
+        mediante sensores FSR402
     </p>
-    <p class="verde">● SISTEMA ACTIVO - MODO SIMULACION</p>
+
+    <p class="muted">
+        Ingeniería Biomédica |
+        Proyecto Integrador |
+        TESI
+    </p>
+
+    <span class="status" id="conexion">
+        ● Esperando ESP32
+    </span>
+
+</div>
+
 </header>
 
-<div class="contenedor">
+<main>
+
+<!-- ==================================
+     CONTROLES DEL SISTEMA
+=================================== -->
 
 <section class="panel">
-    <h2>Monitoreo de sensores FSR402</h2>
 
-    <div class="tarjetas">
+    <h2>Monitoreo de cuatro sensores FSR402</h2>
 
-        <div class="tarjeta">
-            <h3>Sensor 1 - Izquierdo</h3>
-            <div class="numero" id="valor0">20%</div>
-            <div class="barra">
-                <div class="progreso" id="barra0"></div>
-            </div>
-            <div class="estado" id="estado0">BAJO</div>
-        </div>
-
-        <div class="tarjeta">
-            <h3>Sensor 2 - Central</h3>
-            <div class="numero" id="valor1">30%</div>
-            <div class="barra">
-                <div class="progreso" id="barra1"></div>
-            </div>
-            <div class="estado" id="estado1">BAJO</div>
-        </div>
-
-        <div class="tarjeta">
-            <h3>Sensor 3 - Derecho</h3>
-            <div class="numero" id="valor2">20%</div>
-            <div class="barra">
-                <div class="progreso" id="barra2"></div>
-            </div>
-            <div class="estado" id="estado2">BAJO</div>
-        </div>
-
-    </div>
-</section>
-
-<section class="panel">
-    <h2>Control manual de presiones simuladas</h2>
-
-    <p>
-        Mueve las barras para simular diferentes niveles
-        de presion sobre la region lumbosacra.
+    <p class="muted">
+        Lecturas físicas recibidas mediante Wi-Fi.
+        El porcentaje representa el nivel relativo
+        de la señal del sensor, no presión clínica.
     </p>
 
-    <div class="control">
-        <label>Sensor izquierdo:
-            <span id="controlValor0">20%</span>
-        </label>
-        <input type="range" min="0" max="100"
-               value="20" id="slider0">
+    <div class="controls">
+
+        <button id="start">
+            Iniciar visualización
+        </button>
+
+        <button id="stop">
+            Detener visualización
+        </button>
+
+        <button id="reset">
+            Reiniciar gráfica y registro
+        </button>
+
+        <button id="sound">
+            Activar sonido
+        </button>
+
+        <button id="mute">
+            Silenciar alarma
+        </button>
+
     </div>
 
-    <div class="control">
-        <label>Sensor central:
-            <span id="controlValor1">30%</span>
-        </label>
-        <input type="range" min="0" max="100"
-               value="30" id="slider1">
-    </div>
+    <p class="muted" id="info">
+        Esperando datos reales.
+    </p>
 
-    <div class="control">
-        <label>Sensor derecho:
-            <span id="controlValor2">20%</span>
-        </label>
-        <input type="range" min="0" max="100"
-               value="20" id="slider2">
-    </div>
-
-    <button onclick="restablecer()">
-        Restablecer presiones
-    </button>
 </section>
 
-<div class="fila">
+<!-- ==================================
+     TARJETAS DE LOS CUATRO SENSORES
+=================================== -->
+
+<div class="cards" id="cards"></div>
+
+<div class="two">
+
+<!-- ==================================
+     MAPA LUMBOSACRO
+=================================== -->
 
 <section class="panel">
-    <h2>Mapa de distribucion de presion</h2>
 
-    <div class="mapa">
-        <div class="zona" id="zona0">IZQ.</div>
-        <div class="zona central" id="zona1">CENTRO</div>
-        <div class="zona" id="zona2">DER.</div>
+    <h2>Distribución lumbosacra</h2>
+
+    <p class="muted">
+
+        Vista posterior esquemática.
+        Cuatro sensores colocados horizontalmente.
+
+    </p>
+
+    <svg viewBox="0 0 340 230"
+    role="img"
+    aria-label="Espalda baja con cuatro sensores">
+
+        <!-- Contorno de espalda -->
+
+        <path
+
+        d="M107 13
+        Q170 0 233 13
+        L267 48
+        Q240 84 240 112
+        L255 169
+        Q266 198 248 220
+        L92 220
+        Q74 198 85 169
+        L100 112
+        Q100 84 73 48 Z"
+
+        fill="#e0f2fe"
+
+        stroke="#94c8dc"
+
+        stroke-width="2"/>
+
+        <!-- Columna vertebral -->
+
+        <path
+
+        d="M170 15
+        Q166 70 170 112
+        T170 184"
+
+        stroke="#7db7cd"
+
+        stroke-width="2"
+
+        stroke-dasharray="4 5"
+
+        fill="none"/>
+
+        <!-- Region de monitoreo -->
+
+        <rect
+
+        x="86"
+        y="135"
+
+        width="168"
+        height="48"
+
+        rx="13"
+
+        fill="#cffafe"
+
+        stroke="#67e8f9"/>
+
+        <!-- Sensores dinamicos -->
+
+        <g id="zones"></g>
+
+    </svg>
+
+    <div class="legend">
+
+        <span style="color:#0d9488">
+            ● Normal
+        </span>
+
+        <span style="color:#b45309">
+            ● Preventivo
+        </span>
+
+        <span style="color:#be123c">
+            ● Riesgo
+        </span>
+
+        <span style="color:#64748b">
+            ● Sin datos
+        </span>
+
     </div>
 
-    <p class="verde">● Verde: presion baja</p>
-    <p class="amarillo">● Amarillo: presion media</p>
-    <p class="rojo">● Rojo: presion alta</p>
 </section>
 
+<!-- ==================================
+     ESTADO Y ALARMAS
+=================================== -->
+
 <section class="panel">
-    <h2>Estado del sistema</h2>
 
-    <p>Modo: <strong>SIMULACION MANUAL</strong></p>
-    <p>Tiempo de monitoreo:
-        <strong id="tiempo">0 s</strong>
+    <h2>Estado y alertas</h2>
+
+    <div class="alert" id="alert">
+
+        Esperando datos reales
+
+    </div>
+
+    <p id="max">
+        Nivel máximo: —
     </p>
-    <p>Presion maxima:
-        <strong id="maximo">0%</strong>
+
+    <p id="duration">
+        Mayor permanencia: —
     </p>
-    <p>Frecuencia: 1 lectura por segundo</p>
 
-    <button onclick="activarSonido()">
-        Activar sonido
-    </button>
+    <p id="high">
+        Tiempo de nivel alto: —
+    </p>
 
-    <button onclick="silenciar()">
-        Silenciar alarma
-    </button>
+    <p class="muted">
 
-    <p id="estadoSonido">Sonido desactivado</p>
+        Condiciones experimentales:
+
+        <br><br>
+
+        Normal: menor a 40%.
+
+        <br>
+
+        Preventivo: de 40% a menos de 70%.
+
+        <br>
+
+        Riesgo experimental: 70% o más.
+
+        <br><br>
+
+        La alarma se activa después de
+        10 segundos de nivel alto.
+
+        <br>
+
+        El tiempo de permanencia comienza
+        desde un nivel de carga del 5%.
+
+    </p>
+
+    <p class="muted" id="audioState">
+
+        Sonido desactivado
+
+    </p>
+
 </section>
 
 </div>
 
-<section class="panel">
-    <h2>Grafica de monitoreo en tiempo real</h2>
-    <canvas id="grafica" width="900" height="260"></canvas>
+<!-- ==================================
+     GRAFICA EN TIEMPO REAL
+=================================== -->
 
-    <p>
-        <span class="verde">● Sensor izquierdo</span> |
-        <span class="amarillo">● Sensor central</span> |
-        <span class="rojo">● Sensor derecho</span>
+<section class="panel">
+
+    <h2>Gráfica de monitoreo en tiempo real</h2>
+
+    <p class="muted">
+
+        Nivel relativo (%) contra tiempo (s).
+        Últimas 60 muestras recibidas.
+
     </p>
+
+    <canvas id="chart"></canvas>
+
+    <div class="legend" id="legend"></div>
+
 </section>
 
-<section class="panel">
-    <h2>Sistema de alarmas</h2>
-
-    <div class="alerta" id="alerta">
-        MONITOREO NORMAL
-    </div>
-
-    <p>
-        La alarma se activa si un sensor permanece
-        en 70% o mas durante 10 segundos consecutivos.
-    </p>
-
-    <p id="contadorAlarma">
-        Tiempo de presion alta: 0 segundos
-    </p>
-</section>
+<!-- ==================================
+     REGISTRO DE EVENTOS
+=================================== -->
 
 <section class="panel">
+
     <h2>Registro de eventos</h2>
 
-    <div class="registro" id="registro">
-        Sistema iniciado en modo simulacion.
+    <div class="log" id="log">
+
+        Sin eventos registrados.
+
     </div>
+
 </section>
 
-</div>
+</main>
 
 <footer>
-    Prototipo academico - Valores simulados
-    - No apto para diagnostico clinico
+
+    Prototipo académico de Ingeniería Biomédica.
+
+    <br>
+
+    No apto para diagnóstico clínico.
+    No ingresar datos identificables de pacientes.
+
 </footer>
+
+<!-- ==================================
+     JAVASCRIPT
+=================================== -->
 
 <script>
 
-// Valores iniciales
-let presiones = [20, 30, 20];
+// Nombres de las cuatro zonas
 
-// Historial de cada sensor
-let historiales = [[], [], []];
+const names = [
 
-// Segundos consecutivos en presion alta
-let contadores = [0, 0, 0];
+    "Lateral izquierdo",
 
-let tiempo = 0;
-let alarmaActiva = false;
-let sonidoHabilitado = false;
-let silenciada = false;
-let audioCtx = null;
+    "Medial izquierdo",
 
-const canvas = document.getElementById("grafica");
-const ctx = canvas.getContext("2d");
+    "Medial derecho",
 
-const coloresGrafica = [
-    "#4ade80",
-    "#facc15",
-    "#fb7185"
+    "Lateral derecho"
+
 ];
 
-// Configurar controles deslizantes
-for (let i = 0; i < 3; i++) {
-    document.getElementById("slider" + i)
-        .addEventListener("input", function() {
+// Colores de las cuatro curvas
 
-        presiones[i] = Number(this.value);
+const colors = [
 
-        document.getElementById(
-            "controlValor" + i
-        ).textContent = this.value + "%";
+    "#0891b2",
 
-        actualizarPantalla();
-    });
+    "#0d9488",
+
+    "#e11d48",
+
+    "#6366f1"
+
+];
+
+const $ = id => document.getElementById(id);
+
+// Variables de monitoreo
+
+let running = true;
+
+let history = [];
+
+let lastSeq = null;
+
+let lastStamp = 0;
+
+let origin = 0;
+
+let prevStates = [];
+
+let prevAlarm = "";
+
+let connected = null;
+
+let audio = null;
+
+let muted = true;
+
+let lastBeep = 0;
+
+let busy = false;
+
+let generation = 0;
+
+
+// =====================================
+// CREAR CUATRO TARJETAS
+// =====================================
+
+const cards = $("cards");
+
+for (let i = 0; i < 4; i++) {
+
+    cards.insertAdjacentHTML(
+
+        "beforeend",
+
+        `
+        <article class="sensor">
+
+            <div class="muted">
+
+                SENSOR 0${i+1}
+
+            </div>
+
+            <h3>${names[i]}</h3>
+
+            <div class="number" id="n${i}">
+
+                —
+
+            </div>
+
+            <div class="bar">
+
+                <div class="fill" id="b${i}">
+
+                </div>
+
+            </div>
+
+            <p class="muted" id="r${i}">
+
+                Resistencia: —
+
+            </p>
+
+            <p class="muted" id="adc${i}">
+
+                ADC: —
+
+            </p>
+
+            <p class="muted" id="t${i}">
+
+                Permanencia: —
+
+            </p>
+
+            <p class="muted" id="a${i}">
+
+                Nivel alto: —
+
+            </p>
+
+            <div class="state" id="s${i}">
+
+                SIN DATOS
+
+            </div>
+
+        </article>
+        `
+    );
+
+    // Crear los cuatro sensores horizontales
+
+    $("zones").insertAdjacentHTML(
+
+        "beforeend",
+
+        `
+        <circle
+
+            id="z${i}"
+
+            cx="${110 + 40*i}"
+
+            cy="159"
+
+            r="16"
+
+            fill="#94a3b8"
+
+            stroke="white"
+
+            stroke-width="2"
+
+        />
+
+        <text
+
+            x="${110 + 40*i}"
+
+            y="163"
+
+            text-anchor="middle"
+
+            font-size="11"
+
+            font-weight="bold"
+
+            fill="#164e63"
+
+        >
+
+            S${i+1}
+
+        </text>
+        `
+    );
+
+    // Crear leyenda de grafica
+
+    $("legend").insertAdjacentHTML(
+
+        "beforeend",
+
+        `
+        <span style="color:${colors[i]}">
+
+            ● S${i+1} ${names[i]}
+
+        </span>
+        `
+    );
 }
 
-function clasificar(valor) {
-    if (valor >= 70) {
-        return ["ALTO", "#fb7185"];
+
+// =====================================
+// REGISTRO DE EVENTOS
+// =====================================
+
+function log(msg) {
+
+    const el = document.createElement("div");
+
+    el.textContent =
+
+        new Date().toLocaleTimeString()
+
+        + " — " + msg;
+
+    if (!$("log").children.length) {
+
+        $("log").textContent = "";
     }
 
-    if (valor >= 40) {
-        return ["MEDIO", "#facc15"];
-    }
+    $("log").prepend(el);
 
-    return ["BAJO", "#22c55e"];
-}
+    while ($("log").children.length > 40) {
 
-function registrar(mensaje) {
-    const registro = document.getElementById("registro");
-    const linea = document.createElement("div");
-    const hora = new Date().toLocaleTimeString();
-
-    linea.textContent = hora + " - " + mensaje;
-    registro.prepend(linea);
-
-    while (registro.children.length > 40) {
-        registro.lastElementChild.remove();
+        $("log").lastElementChild.remove();
     }
 }
 
-function actualizarPantalla() {
-    presiones.forEach((valor, i) => {
-        const [estado, color] = clasificar(valor);
 
-        const numero = document.getElementById("valor" + i);
-        numero.textContent = valor + "%";
-        numero.style.color = color;
+// =====================================
+// COLORES SEGUN ESTADO
+// =====================================
 
-        const barra = document.getElementById("barra" + i);
-        barra.style.width = valor + "%";
-        barra.style.background = color;
+function color(estado) {
 
-        const texto = document.getElementById("estado" + i);
-        texto.textContent = estado;
-        texto.style.color = color;
+    if (estado === "RIESGO") {
 
-        document.getElementById(
-            "zona" + i
-        ).style.background = color;
-    });
-
-    document.getElementById("maximo").textContent =
-        Math.max(...presiones) + "%";
-}
-
-function activarSonido() {
-    try {
-        audioCtx = audioCtx || new (
-            window.AudioContext || window.webkitAudioContext
-        )();
-
-        audioCtx.resume();
-        sonidoHabilitado = true;
-        silenciada = false;
-
-        document.getElementById("estadoSonido")
-            .textContent = "Sonido activado";
-
-        registrar("Sonido de alarma activado");
-
-        // Pitido de prueba
-        beep();
-
-    } catch(error) {
-        registrar("Error al activar sonido");
-    }
-}
-
-function silenciar() {
-    silenciada = true;
-
-    document.getElementById("estadoSonido")
-        .textContent = "Alarma silenciada";
-
-    registrar("Alarma silenciada");
-}
-
-function beep() {
-    if (!sonidoHabilitado || silenciada || !audioCtx) {
-        return;
+        return "#e11d48";
     }
 
-    const oscilador = audioCtx.createOscillator();
-    const volumen = audioCtx.createGain();
+    if (estado === "PREVENTIVO") {
 
-    oscilador.type = "sine";
-    oscilador.frequency.value = 850;
-
-    volumen.gain.value = 0.12;
-
-    oscilador.connect(volumen);
-    volumen.connect(audioCtx.destination);
-
-    oscilador.start();
-    oscilador.stop(audioCtx.currentTime + 0.25);
-}
-
-function restablecer() {
-    presiones = [20, 30, 20];
-    contadores = [0, 0, 0];
-    alarmaActiva = false;
-    silenciada = false;
-
-    for (let i = 0; i < 3; i++) {
-        document.getElementById(
-            "slider" + i
-        ).value = presiones[i];
-
-        document.getElementById(
-            "controlValor" + i
-        ).textContent = presiones[i] + "%";
+        return "#b45309";
     }
 
-    actualizarPantalla();
-    actualizarAlarma();
-    registrar("Presiones restablecidas");
+    return "#0d9488";
 }
 
-function dibujarGrafica() {
-    const w = canvas.width;
-    const h = canvas.height;
 
-    ctx.clearRect(0, 0, w, h);
+// =====================================
+// LIMPIAR LECTURAS
+// =====================================
 
-    // Cuadricula
-    ctx.strokeStyle = "#29465e";
-    ctx.lineWidth = 1;
+function clearReadings(message) {
 
-    for (let i = 0; i <= 4; i++) {
-        const y = 15 + i * (h - 30) / 4;
+    for (let i = 0; i < 4; i++) {
 
-        ctx.beginPath();
-        ctx.moveTo(38, y);
-        ctx.lineTo(w - 10, y);
-        ctx.stroke();
+        $("n"+i).textContent = "—";
 
-        ctx.fillStyle = "#b8d0e0";
-        ctx.font = "12px Arial";
+        $("n"+i).style.color = "#64748b";
 
-        ctx.fillText(
-            (100 - i * 25) + "%",
-            2,
-            y + 4
+        $("b"+i).style.width = "0%";
+
+        $("r"+i).textContent =
+
+            "Resistencia: —";
+
+        $("adc"+i).textContent =
+
+            "ADC: —";
+
+        $("t"+i).textContent =
+
+            "Permanencia: —";
+
+        $("a"+i).textContent =
+
+            "Nivel alto: —";
+
+        $("s"+i).textContent =
+
+            "SIN DATOS";
+
+        $("s"+i).style.color = "#64748b";
+
+        $("z"+i).setAttribute(
+
+            "fill", "#94a3b8"
+
         );
     }
 
-    historiales.forEach((datos, sensor) => {
+    $("alert").className = "alert";
+
+    $("alert").textContent = message;
+
+    $("max").textContent =
+
+        "Nivel máximo: —";
+
+    $("duration").textContent =
+
+        "Mayor permanencia: —";
+
+    $("high").textContent =
+
+        "Tiempo de nivel alto: —";
+}
+
+
+// =====================================
+// ALARMA AUDIBLE
+// =====================================
+
+function beep() {
+
+    if (
+
+        muted ||
+
+        !audio ||
+
+        audio.state !== "running"
+
+    ) {
+
+        return;
+    }
+
+    const oscillator = audio.createOscillator();
+
+    const gain = audio.createGain();
+
+    oscillator.frequency.value = 850;
+
+    gain.gain.value = 0.12;
+
+    oscillator.connect(gain);
+
+    gain.connect(audio.destination);
+
+    oscillator.start();
+
+    oscillator.stop(
+
+        audio.currentTime + 0.25
+
+    );
+}
+
+
+// =====================================
+// BOTON ACTIVAR SONIDO
+// =====================================
+
+$("sound").onclick = async () => {
+
+    try {
+
+        audio = audio || new (
+
+            window.AudioContext ||
+
+            window.webkitAudioContext
+
+        )();
+
+        await audio.resume();
+
+        muted = false;
+
+        $("audioState").textContent =
+
+            "Sonido activado";
+
+        log("Sonido de alarma activado");
+
+        beep();
+
+    } catch (error) {
+
+        $("audioState").textContent =
+
+            "No se pudo activar el sonido";
+    }
+};
+
+
+// =====================================
+// BOTON SILENCIAR
+// =====================================
+
+$("mute").onclick = () => {
+
+    muted = true;
+
+    $("audioState").textContent =
+
+        "Alarma silenciada";
+
+    log("Alarma audible silenciada");
+};
+
+
+// =====================================
+// BOTON DETENER
+// =====================================
+
+$("stop").onclick = () => {
+
+    running = false;
+
+    generation++;
+
+    $("conexion").textContent =
+
+        "● Visualización detenida";
+
+    $("info").textContent =
+
+        "La ESP32 continúa midiendo. " +
+
+        "Solo se detuvo esta pantalla.";
+
+    clearReadings(
+
+        "Visualización detenida"
+
+    );
+
+    log("Visualización detenida");
+};
+
+
+// =====================================
+// BOTON INICIAR
+// =====================================
+
+$("start").onclick = () => {
+
+    if (!running) {
+
+        running = true;
+
+        generation++;
+
+        connected = null;
+
+        log("Visualización iniciada");
+
+        poll();
+    }
+};
+
+
+// =====================================
+// BOTON REINICIAR
+// =====================================
+
+$("reset").onclick = () => {
+
+    history = [];
+
+    origin = 0;
+
+    lastSeq = null;
+
+    lastStamp = 0;
+
+    prevStates = [];
+
+    prevAlarm = "";
+
+    $("log").textContent = "";
+
+    log(
+
+        "Gráfica y registro reiniciados. " +
+
+        "Temporizadores de ESP32 no modificados."
+
+    );
+
+    draw();
+};
+
+
+// =====================================
+// DIBUJAR GRAFICA
+// =====================================
+
+function draw() {
+
+    const canvas = $("chart");
+
+    const width = canvas.clientWidth;
+
+    const height = canvas.clientHeight;
+
+    const pixelRatio =
+
+        window.devicePixelRatio || 1;
+
+    if (!width || !height) {
+
+        return;
+    }
+
+    canvas.width = width * pixelRatio;
+
+    canvas.height = height * pixelRatio;
+
+    const ctx = canvas.getContext("2d");
+
+    ctx.scale(pixelRatio, pixelRatio);
+
+    const left = 44;
+
+    const right = width - 14;
+
+    const top = 15;
+
+    const bottom = height - 32;
+
+    ctx.font = "11px Arial";
+
+    ctx.strokeStyle = "#dceaf0";
+
+    ctx.fillStyle = "#526c7d";
+
+    // Eje vertical
+
+    for (let v = 0; v <= 100; v += 25) {
+
+        let y = bottom -
+
+            (bottom - top) * v / 100;
+
         ctx.beginPath();
-        ctx.strokeStyle = coloresGrafica[sensor];
-        ctx.lineWidth = 3;
 
-        datos.forEach((valor, i) => {
-            const x = 38 + i * (w - 50) / 59;
-            const y = 15 + (100 - valor) *
-                      (h - 30) / 100;
+        ctx.moveTo(left, y);
 
-            if (i === 0) {
-                ctx.moveTo(x, y);
-            } else {
-                ctx.lineTo(x, y);
+        ctx.lineTo(right, y);
+
+        ctx.stroke();
+
+        ctx.fillText(
+
+            v + "%", 3, y + 4
+
+        );
+    }
+
+    // Eje horizontal
+
+    const first = history.length ?
+
+        history[0].t : 0;
+
+    const end = history.length ?
+
+        Math.max(
+
+            first + 1,
+
+            history[history.length-1].t
+
+        ) : 60;
+
+    for (let i = 0; i <= 4; i++) {
+
+        let x = left +
+
+            (right-left) * i / 4;
+
+        ctx.fillText(
+
+            Math.round(
+
+                first + (end-first)*i/4
+
+            ) + "s",
+
+            x-8,
+
+            height-9
+
+        );
+    }
+
+    // Dibujar cuatro curvas
+
+    colors.forEach((col, sensor) => {
+
+        ctx.strokeStyle = col;
+
+        ctx.lineWidth = 2.5;
+
+        ctx.beginPath();
+
+        let started = false;
+
+        history.forEach(point => {
+
+            if (point.v === null) {
+
+                started = false;
+
+                return;
             }
+
+            let x = left +
+
+                (right-left) *
+
+                (point.t-first) /
+
+                (end-first);
+
+            let y = bottom -
+
+                (bottom-top) *
+
+                point.v[sensor] / 100;
+
+            if (started) {
+
+                ctx.lineTo(x,y);
+
+            } else {
+
+                ctx.moveTo(x,y);
+            }
+
+            started = true;
         });
 
         ctx.stroke();
     });
+
+    // Mostrar primer punto recibido
+
+    if (
+
+        history.length === 1 &&
+
+        history[0].v
+
+    ) {
+
+        colors.forEach((col,i) => {
+
+            ctx.fillStyle = col;
+
+            ctx.beginPath();
+
+            ctx.arc(
+
+                left,
+
+                bottom -
+
+                (bottom-top) *
+
+                history[0].v[i] / 100,
+
+                3,
+
+                0,
+
+                Math.PI*2
+
+            );
+
+            ctx.fill();
+        });
+    }
 }
 
-function actualizarAlarma() {
-    const alerta = document.getElementById("alerta");
 
-    const sensoresEnAlarma = contadores
-        .map((contador, i) => contador >= 10 ? i + 1 : null)
-        .filter(x => x !== null);
+// =====================================
+// DETECTAR DESCONEXION
+// =====================================
 
-    const nuevaAlarma = sensoresEnAlarma.length > 0;
+function offline(message) {
 
-    if (nuevaAlarma) {
-        alerta.textContent =
-            "ALERTA: PRESION SOSTENIDA - SENSOR " +
-            sensoresEnAlarma.join(", ");
+    if (connected !== false) {
 
-        alerta.classList.add("activa");
+        log(message);
 
-        if (!alarmaActiva) {
-            registrar(
-                "Alerta de presion sostenida en sensor " +
-                sensoresEnAlarma.join(", ")
+        if (history.length) {
+
+            history.push({
+
+                t: history[history.length-1].t + 1,
+
+                v: null
+
+            });
+
+            if (history.length > 60) {
+
+                history.shift();
+            }
+
+            draw();
+        }
+    }
+
+    connected = false;
+
+    prevStates = [];
+
+    prevAlarm = "";
+
+    $("conexion").textContent =
+
+        "● ESP32 sin conexión";
+
+    $("info").textContent = message;
+
+    clearReadings(
+
+        "Sin datos recientes. " +
+
+        "No se puede evaluar la carga."
+
+    );
+}
+
+
+// =====================================
+// RECIBIR DATOS REALES DEL SERVIDOR
+// =====================================
+
+async function poll() {
+
+    if (!running || busy) {
+
+        return;
+    }
+
+    busy = true;
+
+    const gen = generation;
+
+    try {
+
+        const response = await fetch(
+
+            "/api/datos",
+
+            {
+
+                cache: "no-store",
+
+                signal: AbortSignal.timeout(5000)
+
+            }
+        );
+
+        if (!response.ok) {
+
+            throw Error(
+
+                "HTTP " + response.status
+
             );
         }
 
-    } else {
-        alerta.textContent = "MONITOREO NORMAL";
-        alerta.classList.remove("activa");
-    }
+        const data = await response.json();
 
-    alarmaActiva = nuevaAlarma;
+        if (!running || gen !== generation) {
 
-    document.getElementById("contadorAlarma")
-        .textContent =
-        "Tiempo de presion alta: " +
-        Math.max(...contadores) + " segundos";
-}
-
-function cicloMonitoreo() {
-    tiempo++;
-
-    document.getElementById("tiempo")
-        .textContent = tiempo + " s";
-
-    presiones.forEach((valor, i) => {
-        historiales[i].push(valor);
-
-        if (historiales[i].length > 60) {
-            historiales[i].shift();
+            return;
         }
 
-        if (valor >= 70) {
-            contadores[i]++;
-        } else {
-            contadores[i] = 0;
+        if (
+
+            !data.conectado ||
+
+            data.sensores.length !== 4
+
+        ) {
+
+            offline(
+
+                "Esperando mediciones recientes " +
+
+                "de la ESP32"
+
+            );
+
+            return;
         }
-    });
 
-    dibujarGrafica();
-    actualizarAlarma();
+        if (connected !== true) {
 
-    if (alarmaActiva) {
-        // Pitido repetido cada 2 segundos
-        if (tiempo % 2 === 0) {
+            log("ESP32 conectada");
+        }
+
+        connected = true;
+
+        $("conexion").textContent =
+
+            "● ESP32 conectada";
+
+        $("info").textContent =
+
+            "Última lectura: " +
+
+            new Date(
+
+                data.ultima * 1000
+
+            ).toLocaleTimeString();
+
+        const rows = data.sensores;
+
+
+        // Actualizar las cuatro tarjetas
+
+        rows.forEach((sensor,i) => {
+
+            const c = color(sensor.estado);
+
+            $("n"+i).textContent =
+
+                sensor.nivel.toFixed(1) + "%";
+
+            $("n"+i).style.color = c;
+
+            $("b"+i).style.width =
+
+                sensor.nivel + "%";
+
+            $("b"+i).style.background = c;
+
+            $("r"+i).textContent =
+
+                "Resistencia: " +
+
+                (
+
+                    sensor.resistencia === null ?
+
+                    "Fuera de rango" :
+
+                    sensor.resistencia.toFixed(3)
+
+                    + " kΩ"
+
+                );
+
+            $("adc"+i).textContent =
+
+                "ADC: " + sensor.adc;
+
+            $("t"+i).textContent =
+
+                "Permanencia: " +
+
+                sensor.permanencia + " s";
+
+            $("a"+i).textContent =
+
+                "Nivel alto: " +
+
+                sensor.tiempo_alto + " s";
+
+            $("s"+i).textContent =
+
+                sensor.estado === "RIESGO" ?
+
+                "RIESGO EXPERIMENTAL" :
+
+                sensor.estado;
+
+            $("s"+i).style.color = c;
+
+            // Actualizar mapa de espalda
+
+            $("z"+i).setAttribute(
+
+                "fill", c
+
+            );
+
+            // Registrar cambio de estado
+
+            if (
+
+                prevStates[i] !== sensor.estado
+
+            ) {
+
+                log(
+
+                    "S" + (i+1) +
+
+                    " — " + sensor.estado
+
+                );
+            }
+
+            prevStates[i] = sensor.estado;
+        });
+
+
+        // Actualizar valores maximos
+
+        $("max").textContent =
+
+            "Nivel máximo: " +
+
+            Math.max(
+
+                ...rows.map(s => s.nivel)
+
+            ).toFixed(1) + "%";
+
+        $("duration").textContent =
+
+            "Mayor permanencia: " +
+
+            Math.max(
+
+                ...rows.map(s => s.permanencia)
+
+            ) + " s";
+
+        $("high").textContent =
+
+            "Tiempo de nivel alto: " +
+
+            Math.max(
+
+                ...rows.map(s => s.tiempo_alto)
+
+            ) + " s";
+
+
+        // Detectar sensores en alarma
+
+        const alarms = rows
+
+            .filter(s => s.alarma)
+
+            .map(s => "S" + s.sensor)
+
+            .join(", ");
+
+        $("alert").className =
+
+            "alert " +
+
+            (alarms ? "high" : "ok");
+
+        $("alert").textContent =
+
+            alarms ?
+
+            "ALERTA DE CARGA SOSTENIDA — "
+
+            + alarms :
+
+            "Sin alarma de carga sostenida";
+
+
+        // Registrar activacion de alarma
+
+        if (alarms !== prevAlarm) {
+
+            log(
+
+                alarms ?
+
+                "Alerta activada: " + alarms :
+
+                "Alerta desactivada"
+
+            );
+
+            prevAlarm = alarms;
+        }
+
+
+        // Activar pitido cada dos segundos
+
+        if (
+
+            alarms &&
+
+            Date.now()-lastBeep >= 2000
+
+        ) {
+
             beep();
+
+            lastBeep = Date.now();
         }
+
+
+        // Guardar datos nuevos en grafica
+
+        if (
+
+            data.secuencia !== lastSeq ||
+
+            data.ultima !== lastStamp
+
+        ) {
+
+            if (!origin) {
+
+                origin = data.ultima;
+            }
+
+            history.push({
+
+                t: Math.max(
+
+                    0,
+
+                    data.ultima-origin
+
+                ),
+
+                v: rows.map(s => s.nivel)
+
+            });
+
+            if (history.length > 60) {
+
+                history.shift();
+            }
+
+            lastSeq = data.secuencia;
+
+            lastStamp = data.ultima;
+
+            draw();
+        }
+
+    } catch (error) {
+
+        if (running && gen === generation) {
+
+            offline(
+
+                "No se pudo consultar el servidor"
+
+            );
+        }
+
+    } finally {
+
+        busy = false;
     }
 }
 
-// Inicializar
-actualizarPantalla();
-dibujarGrafica();
 
-// Una actualizacion por segundo
-setInterval(cicloMonitoreo, 1000);
+// =====================================
+// INICIAR INTERFAZ
+// =====================================
+
+window.addEventListener(
+
+    "resize", draw
+
+);
+
+draw();
+
+poll();
+
+setInterval(poll, 1000);
 
 </script>
 
 </body>
+
 </html>
 """
 
+
+# ==========================================
+# PAGINA PRINCIPAL
+# ==========================================
+
 @app.route("/")
 def inicio():
+
     return render_template_string(HTML)
 
 
+# ==========================================
+# EJECUTAR FLASK EN SPYDER
+# ==========================================
+
 if __name__ == "__main__":
+
     app.run(
+
         host="127.0.0.1",
+
         port=5000,
+
         debug=False,
+
         use_reloader=False
+
     )
